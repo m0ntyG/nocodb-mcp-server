@@ -3,7 +3,7 @@
   "version": "1.0.24",
   "description": "Model Context Protocol server for nocodb",
   "scripts": {
-    "build": "tsc"
+    "build": "esbuild src/start.ts --bundle --platform=node --target=node18 --format=esm --outfile=dist/start.js --external:@modelcontextprotocol/sdk --external:axios --external:zod"
   },
   "type": "module",
   "files": [
@@ -30,11 +30,12 @@
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
-    "typescript": "5.8.3"
+    "esbuild": "^0.27.2",
+    "typescript": "^5.6.3"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.8.0",
-    "axios": "1.8.4",
-    "zod": "3.24.2"
+    "@modelcontextprotocol/sdk": "^1.25.3",
+    "axios": "^1.13.4",
+    "zod": "^3.24.2"
   }
 }

@@ -2,20 +2,53 @@
 import {McpServer, ResourceTemplate} from "@modelcontextprotocol/sdk/server/mcp.js";
 import {StdioServerTransport} from "@modelcontextprotocol/sdk/server/stdio.js";
 import {z} from "zod";
-import axios, {AxiosInstance} from "axios";
+import axios, {AxiosInstance, AxiosError} from "axios";
 import {fork} from "node:child_process";
 
-let {NOCODB_URL, NOCODB_BASE_ID, NOCODB_API_TOKEN} = process.env;
-if (!NOCODB_URL || !NOCODB_BASE_ID || !NOCODB_API_TOKEN) {
-    // check from npx param input
-    NOCODB_URL = process.argv[2] || NOCODB_URL;
-    NOCODB_BASE_ID = process.argv[3] || NOCODB_BASE_ID;
-    NOCODB_API_TOKEN = process.argv[4] || NOCODB_API_TOKEN;
+// Configuration validation schema
+const ConfigSchema = z.object({
+    NOCODB_URL: z.string().url().min(1, "NOCODB_URL must be a valid URL"),
+    NOCODB_BASE_ID: z.string().min(1, "NOCODB_BASE_ID is required"),
+    NOCODB_API_TOKEN: z.string().min(1, "NOCODB_API_TOKEN is required"),
+});
 
-    if (!NOCODB_URL || !NOCODB_BASE_ID || !NOCODB_API_TOKEN) {
-        throw new Error("Missing required environment variables");
+// Validate and get configuration
+function getValidatedConfig() {
+    let NOCODB_URL = process.env.NOCODB_URL || process.argv[2];
+    let NOCODB_BASE_ID = process.env.NOCODB_BASE_ID || process.argv[3];
+    let NOCODB_API_TOKEN = process.env.NOCODB_API_TOKEN || process.argv[4];
+
+    try {
+        return ConfigSchema.parse({
+            NOCODB_URL,
+            NOCODB_BASE_ID,
+            NOCODB_API_TOKEN,
+        });
+    } catch (error) {
+        if (error instanceof z.ZodError) {
+            const messages = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
+            throw new Error(`Configuration validation failed: ${messages}`);
+        }
+        throw error;
     }
 }
+
+// Get config but allow it to fail gracefully during module load
+let config: { NOCODB_URL: string; NOCODB_BASE_ID: string; NOCODB_API_TOKEN: string; };
+try {
+    config = getValidatedConfig();
+} catch (error) {
+    // If validation fails during module load, we'll retry in main()
+    config = {
+        NOCODB_URL: process.env.NOCODB_URL || '',
+        NOCODB_BASE_ID: process.env.NOCODB_BASE_ID || '',
+        NOCODB_API_TOKEN: process.env.NOCODB_API_TOKEN || '',
+    };
+}
+
+let NOCODB_URL = config.NOCODB_URL;
+let NOCODB_BASE_ID = config.NOCODB_BASE_ID;
+let NOCODB_API_TOKEN = config.NOCODB_API_TOKEN;
 
 
 const filterRules =
@@ -81,14 +114,83 @@ For date null rule
 (date,is,null) -> (date,blank).
 `
 
-const nocodbClient: AxiosInstance = axios.create({
-    baseURL: NOCODB_URL.replace(/\/$/, ""),
-    headers: {
-        "xc-token": NOCODB_API_TOKEN,
-        "Content-Type": "application/json",
-    },
-    timeout: 30000,
-});
+// Retry configuration
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+const REQUEST_TIMEOUT = 60000; // 60 seconds
+
+// Simple sleep function for retry delays
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Enhanced error formatter
+function formatAxiosError(error: AxiosError): string {
+    if (error.response) {
+        // Server responded with error status
+        return `NocoDB API error (${error.response.status}): ${JSON.stringify(error.response.data)}`;
+    } else if (error.request) {
+        // Request made but no response received
+        return `No response from NocoDB server. Check if the URL is correct and the server is running: ${error.message}`;
+    } else {
+        // Error in request setup
+        return `Request setup error: ${error.message}`;
+    }
+}
+
+// Axios retry wrapper
+async function axiosWithRetry<T>(
+    requestFn: () => Promise<T>,
+    retries = MAX_RETRIES,
+    context = "API request"
+): Promise<T> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await requestFn();
+        } catch (error) {
+            lastError = error as Error;
+            
+            // Don't retry on client errors (4xx)
+            if (axios.isAxiosError(error) && error.response?.status && error.response.status >= 400 && error.response.status < 500) {
+                throw new Error(formatAxiosError(error));
+            }
+            
+            // If we have retries left, wait and try again
+            if (attempt < retries) {
+                const delay = RETRY_DELAY * Math.pow(2, attempt); // Exponential backoff
+                console.error(`${context} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms...`);
+                await sleep(delay);
+            }
+        }
+    }
+    
+    // All retries exhausted
+    if (axios.isAxiosError(lastError)) {
+        throw new Error(formatAxiosError(lastError));
+    }
+    throw lastError || new Error(`${context} failed after ${retries + 1} attempts`);
+}
+
+// Lazy initialization of the nocodbClient
+let nocodbClient: AxiosInstance;
+
+function getNocodbClient(): AxiosInstance {
+    if (!nocodbClient) {
+        if (!NOCODB_URL || !NOCODB_API_TOKEN) {
+            throw new Error('NocoDB client not initialized. Missing configuration.');
+        }
+        nocodbClient = axios.create({
+            baseURL: NOCODB_URL.replace(/\/$/, ""),
+            headers: {
+                "xc-token": NOCODB_API_TOKEN,
+                "Content-Type": "application/json",
+            },
+            timeout: REQUEST_TIMEOUT,
+            validateStatus: (status) => status >= 200 && status < 300,
+        });
+    }
+    return nocodbClient;
+}
 
 export async function getRecords(tableName: string,
                                  filters?: string,
@@ -97,102 +199,207 @@ export async function getRecords(tableName: string,
                                  sort?: string,
                                  fields?: string,
 ) {
-    const tableId = await getTableId(tableName);
+    try {
+        // Validate table name
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
 
-    const paramsArray = []
-    if (filters) {
-        paramsArray.push(`where=${filters}`);
-    }
-    if (limit) {
-        paramsArray.push(`limit=${limit}`);
-    }
-    if (offset) {
-        paramsArray.push(`offset=${offset}`);
-    }
-    if (sort) {
-        paramsArray.push(`sort=${sort}`);
-    }
-    if (fields) {
-        paramsArray.push(`fields=${fields}`);
-    }
+        const tableId = await getTableId(tableName);
 
-    const queryString = paramsArray.join("&");
-    const response = await nocodbClient.get(`/api/v2/tables/${tableId}/records?${queryString}`,);
-    return {
-        input: {
-            tableName,
-            filters,
-            limit,
-            offset,
-            sort,
-            fields
-        },
-        output: response.data
-    };
+        const paramsArray = []
+        if (filters) {
+            paramsArray.push(`where=${encodeURIComponent(filters)}`);
+        }
+        if (limit !== undefined) {
+            if (limit < 0) throw new Error('Limit must be a non-negative number');
+            paramsArray.push(`limit=${limit}`);
+        }
+        if (offset !== undefined) {
+            if (offset < 0) throw new Error('Offset must be a non-negative number');
+            paramsArray.push(`offset=${offset}`);
+        }
+        if (sort) {
+            paramsArray.push(`sort=${encodeURIComponent(sort)}`);
+        }
+        if (fields) {
+            paramsArray.push(`fields=${encodeURIComponent(fields)}`);
+        }
+
+        const queryString = paramsArray.join("&");
+        const response = await axiosWithRetry(
+            () => getNocodbClient().get(`/api/v2/tables/${tableId}/records?${queryString}`),
+            MAX_RETRIES,
+            `Get records from table '${tableName}'`
+        );
+
+        return {
+            input: {
+                tableName,
+                filters,
+                limit,
+                offset,
+                sort,
+                fields
+            },
+            output: response.data
+        };
+    } catch (error) {
+        throw new Error(`Failed to get records from table '${tableName}': ${(error as Error).message}`);
+    }
 }
 
 export async function postRecords(tableName: string, data: unknown) {
-    const tableId = await getTableId(tableName);
-    const response = await nocodbClient.post(`/api/v2/tables/${tableId}/records`, data);
-    return {
-        output: response.data,
-        input: data
-    };
+    try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+        if (!data) {
+            throw new Error('Data is required for creating records');
+        }
+
+        const tableId = await getTableId(tableName);
+        const response = await axiosWithRetry(
+            () => getNocodbClient().post(`/api/v2/tables/${tableId}/records`, data),
+            MAX_RETRIES,
+            `Create record in table '${tableName}'`
+        );
+
+        return {
+            output: response.data,
+            input: data
+        };
+    } catch (error) {
+        throw new Error(`Failed to create record in table '${tableName}': ${(error as Error).message}`);
+    }
 }
 
 export async function patchRecords(tableName: string, rowId: number, data: any) {
-    const tableId = await getTableId(tableName);
-    const newData = [{
-        ...data,
-        "Id": rowId,
-    }]
+    try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+        if (!rowId || rowId <= 0) {
+            throw new Error('Valid row ID is required (positive number)');
+        }
+        if (!data) {
+            throw new Error('Data is required for updating records');
+        }
 
-    const response = await nocodbClient.patch(`/api/v2/tables/${tableId}/records`, newData);
-    return {
-        output: response.data,
-        input: data
-    };
+        const tableId = await getTableId(tableName);
+        const newData = [{
+            ...data,
+            "Id": rowId,
+        }]
+
+        const response = await axiosWithRetry(
+            () => getNocodbClient().patch(`/api/v2/tables/${tableId}/records`, newData),
+            MAX_RETRIES,
+            `Update record ${rowId} in table '${tableName}'`
+        );
+
+        return {
+            output: response.data,
+            input: data
+        };
+    } catch (error) {
+        throw new Error(`Failed to update record ${rowId} in table '${tableName}': ${(error as Error).message}`);
+    }
 }
 
 export async function deleteRecords(tableName: string, rowId: number) {
-    const tableId = await getTableId(tableName);
-    const data: any =
-        {
+    try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+        if (!rowId || rowId <= 0) {
+            throw new Error('Valid row ID is required (positive number)');
+        }
+
+        const tableId = await getTableId(tableName);
+        const data: any = {
             "Id": rowId
         }
-    const response = await nocodbClient.delete(`/api/v2/tables/${tableId}/records`, {data});
-    return response.data;
+
+        const response = await axiosWithRetry(
+            () => getNocodbClient().delete(`/api/v2/tables/${tableId}/records`, {data}),
+            MAX_RETRIES,
+            `Delete record ${rowId} from table '${tableName}'`
+        );
+
+        return response.data;
+    } catch (error) {
+        throw new Error(`Failed to delete record ${rowId} from table '${tableName}': ${(error as Error).message}`);
+    }
 }
 
 export const getTableId = async (tableName: string): Promise<string> => {
     try {
-        const response = await nocodbClient.get(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`);
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+
+        const response = await axiosWithRetry(
+            () => getNocodbClient().get(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`),
+            MAX_RETRIES,
+            `Get table ID for '${tableName}'`
+        );
+
         const tables = response.data.list || [];
+        if (!Array.isArray(tables)) {
+            throw new Error('Invalid response format from NocoDB API');
+        }
+
         const table = tables.find((t: any) => t.title === tableName);
-        if (!table) throw new Error(`Table '${tableName}' not found`);
+        if (!table) {
+            const availableTables = tables.map((t: any) => t.title).join(', ');
+            throw new Error(`Table '${tableName}' not found. Available tables: ${availableTables || 'none'}`);
+        }
+
         return table.id;
-    } catch (error: any) {
-        throw new Error(`Error retrieving table ID: ${error.message}`);
+    } catch (error) {
+        if ((error as Error).message.includes('Table')) {
+            throw error; // Re-throw table not found errors
+        }
+        throw new Error(`Error retrieving table ID for '${tableName}': ${(error as Error).message}`);
     }
 };
 
 export async function getListTables() {
     try {
-        const response = await nocodbClient.get(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`);
+        const response = await axiosWithRetry(
+            () => getNocodbClient().get(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`),
+            MAX_RETRIES,
+            'Get list of tables'
+        );
+
         const tables = response.data.list || [];
+        if (!Array.isArray(tables)) {
+            throw new Error('Invalid response format from NocoDB API');
+        }
+
         return tables.map((t: any) => t.title);
-    } catch (error: any) {
-        throw new Error(`Error get list tables: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to get list of tables: ${(error as Error).message}`);
     }
 }
 
 export async function getTableMetadata(tableName: string) {
     try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+
         const tableId = await getTableId(tableName);
-        const response = await nocodbClient.get(`/api/v2/meta/tables/${tableId}`);
+        const response = await axiosWithRetry(
+            () => getNocodbClient().get(`/api/v2/meta/tables/${tableId}`),
+            MAX_RETRIES,
+            `Get metadata for table '${tableName}'`
+        );
+
         return response.data;
-    } catch (error: any) {
-        throw new Error(`Error adding column: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to get metadata for table '${tableName}': ${(error as Error).message}`);
     }
 }
 
@@ -206,23 +413,52 @@ export async function getTableMetadata(tableName: string) {
 // Checkbox
 export async function alterTableAddColumn(tableName: string, columnName: string, columnType: string) {
     try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+        if (!columnName || typeof columnName !== 'string' || columnName.trim() === '') {
+            throw new Error('Column name is required and must be a non-empty string');
+        }
+        if (!columnType || typeof columnType !== 'string' || columnType.trim() === '') {
+            throw new Error('Column type is required and must be a non-empty string');
+        }
+
+        const validColumnTypes = ['SingleLineText', 'Number', 'Decimals', 'DateTime', 'Checkbox'];
+        if (!validColumnTypes.includes(columnType)) {
+            throw new Error(`Invalid column type '${columnType}'. Valid types: ${validColumnTypes.join(', ')}`);
+        }
+
         const tableId = await getTableId(tableName);
-        const response = await nocodbClient.post(`/api/v2/meta/tables/${tableId}/columns`, {
-            title: columnName,
-            uidt: columnType,
-        });
+        const response = await axiosWithRetry(
+            () => getNocodbClient().post(`/api/v2/meta/tables/${tableId}/columns`, {
+                title: columnName,
+                uidt: columnType,
+            }),
+            MAX_RETRIES,
+            `Add column '${columnName}' to table '${tableName}'`
+        );
+
         return response.data;
-    } catch (error: any) {
-        throw new Error(`Error adding column: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to add column '${columnName}' to table '${tableName}': ${(error as Error).message}`);
     }
 }
 
 export async function alterTableRemoveColumn(columnId: string) {
     try {
-        const response = await nocodbClient.delete(`/api/v2/meta/columns/${columnId}`);
+        if (!columnId || typeof columnId !== 'string' || columnId.trim() === '') {
+            throw new Error('Column ID is required and must be a non-empty string');
+        }
+
+        const response = await axiosWithRetry(
+            () => getNocodbClient().delete(`/api/v2/meta/columns/${columnId}`),
+            MAX_RETRIES,
+            `Remove column with ID '${columnId}'`
+        );
+
         return response.data;
-    } catch (error: any) {
-        throw new Error(`Error remove column: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to remove column with ID '${columnId}': ${(error as Error).message}`);
     }
 }
 
@@ -234,6 +470,22 @@ type TableColumnType = {
 
 export async function createTable(tableName: string, data: TableColumnType[]) {
     try {
+        if (!tableName || typeof tableName !== 'string' || tableName.trim() === '') {
+            throw new Error('Table name is required and must be a non-empty string');
+        }
+        if (!data || !Array.isArray(data) || data.length === 0) {
+            throw new Error('Column data is required and must be a non-empty array');
+        }
+
+        // Validate each column
+        data.forEach((col, index) => {
+            if (!col.title || typeof col.title !== 'string' || col.title.trim() === '') {
+                throw new Error(`Column at index ${index} must have a valid title`);
+            }
+            if (!col.uidt) {
+                throw new Error(`Column '${col.title}' must have a valid column type (uidt)`);
+            }
+        });
 
         const hasId = data.filter(x => x.title === "Id").length > 0
         if (!hasId) {
@@ -244,41 +496,64 @@ export async function createTable(tableName: string, data: TableColumnType[]) {
             })
         }
 
-        const response = await nocodbClient.post(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`, {
-            title: tableName,
-            columns: data.map((value) => ({
-                title: value.title,
-                uidt: value.uidt
-            })),
-        });
+        const response = await axiosWithRetry(
+            () => getNocodbClient().post(`/api/v2/meta/bases/${NOCODB_BASE_ID}/tables`, {
+                title: tableName,
+                columns: data.map((value) => ({
+                    title: value.title,
+                    uidt: value.uidt
+                })),
+            }),
+            MAX_RETRIES,
+            `Create table '${tableName}'`
+        );
+
         return response.data;
-    } catch (error: any) {
-        throw new Error(`Error creating table: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to create table '${tableName}': ${(error as Error).message}`);
     }
 }
 
 export async function listLinkedRecords(tableId: string, linkFieldId: string, recordId: string, fields?: string, sort?: string, where?: string, offset?: number, limit?: number) {
     try {
+        if (!tableId || typeof tableId !== 'string' || tableId.trim() === '') {
+            throw new Error('Table ID is required and must be a non-empty string');
+        }
+        if (!linkFieldId || typeof linkFieldId !== 'string' || linkFieldId.trim() === '') {
+            throw new Error('Link field ID is required and must be a non-empty string');
+        }
+        if (!recordId || typeof recordId !== 'string' || recordId.trim() === '') {
+            throw new Error('Record ID is required and must be a non-empty string');
+        }
+
         const paramsArray = []
         if (fields) {
-            paramsArray.push(`fields=${fields}`);
+            paramsArray.push(`fields=${encodeURIComponent(fields)}`);
         }
         if (sort) {
-            paramsArray.push(`sort=${sort}`);
+            paramsArray.push(`sort=${encodeURIComponent(sort)}`);
         }
         if (where) {
-            paramsArray.push(`where=${where}`);
+            paramsArray.push(`where=${encodeURIComponent(where)}`);
         }
-        if (offset) {
+        if (offset !== undefined) {
+            if (offset < 0) throw new Error('Offset must be a non-negative number');
             paramsArray.push(`offset=${offset}`);
         }
-        if (limit) {
+        if (limit !== undefined) {
+            if (limit < 0) throw new Error('Limit must be a non-negative number');
             paramsArray.push(`limit=${limit}`);
         }
 
         const queryString = paramsArray.join("&");
         const url = `/api/v2/tables/${tableId}/links/${linkFieldId}/records/${recordId}${queryString ? `?${queryString}` : ''}`;
-        const response = await nocodbClient.get(url);
+
+        const response = await axiosWithRetry(
+            () => getNocodbClient().get(url),
+            MAX_RETRIES,
+            `List linked records for record '${recordId}'`
+        );
+
         return {
             input: {
                 tableId,
@@ -292,15 +567,33 @@ export async function listLinkedRecords(tableId: string, linkFieldId: string, re
             },
             output: response.data
         };
-    } catch (error: any) {
-        throw new Error(`Error listing linked records: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to list linked records: ${(error as Error).message}`);
     }
 }
 
 export async function createLink(tableId: string, linkFieldId: string, recordId: string, linkRecordIds: number[]) {
     try {
+        if (!tableId || typeof tableId !== 'string' || tableId.trim() === '') {
+            throw new Error('Table ID is required and must be a non-empty string');
+        }
+        if (!linkFieldId || typeof linkFieldId !== 'string' || linkFieldId.trim() === '') {
+            throw new Error('Link field ID is required and must be a non-empty string');
+        }
+        if (!recordId || typeof recordId !== 'string' || recordId.trim() === '') {
+            throw new Error('Record ID is required and must be a non-empty string');
+        }
+        if (!linkRecordIds || !Array.isArray(linkRecordIds) || linkRecordIds.length === 0) {
+            throw new Error('Link record IDs is required and must be a non-empty array');
+        }
+
         const payload = linkRecordIds.map(id => ({ Id: id }));
-        const response = await nocodbClient.post(`/api/v2/tables/${tableId}/links/${linkFieldId}/records/${recordId}`, payload);
+        const response = await axiosWithRetry(
+            () => getNocodbClient().post(`/api/v2/tables/${tableId}/links/${linkFieldId}/records/${recordId}`, payload),
+            MAX_RETRIES,
+            `Create links for record '${recordId}'`
+        );
+
         return {
             input: {
                 tableId,
@@ -310,15 +603,33 @@ export async function createLink(tableId: string, linkFieldId: string, recordId:
             },
             output: response.data
         };
-    } catch (error: any) {
-        throw new Error(`Error creating link: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to create links: ${(error as Error).message}`);
     }
 }
 
 export async function deleteLink(tableId: string, linkFieldId: string, recordId: string, linkRecordIds: number[]) {
     try {
+        if (!tableId || typeof tableId !== 'string' || tableId.trim() === '') {
+            throw new Error('Table ID is required and must be a non-empty string');
+        }
+        if (!linkFieldId || typeof linkFieldId !== 'string' || linkFieldId.trim() === '') {
+            throw new Error('Link field ID is required and must be a non-empty string');
+        }
+        if (!recordId || typeof recordId !== 'string' || recordId.trim() === '') {
+            throw new Error('Record ID is required and must be a non-empty string');
+        }
+        if (!linkRecordIds || !Array.isArray(linkRecordIds) || linkRecordIds.length === 0) {
+            throw new Error('Link record IDs is required and must be a non-empty array');
+        }
+
         const payload = linkRecordIds.map(id => ({ Id: id }));
-        const response = await nocodbClient.delete(`/api/v2/tables/${tableId}/links/${linkFieldId}/records/${recordId}`, { data: payload });
+        const response = await axiosWithRetry(
+            () => getNocodbClient().delete(`/api/v2/tables/${tableId}/links/${linkFieldId}/records/${recordId}`, { data: payload }),
+            MAX_RETRIES,
+            `Delete links for record '${recordId}'`
+        );
+
         return {
             input: {
                 tableId,
@@ -328,8 +639,8 @@ export async function deleteLink(tableId: string, linkFieldId: string, recordId:
             },
             output: response.data
         };
-    } catch (error: any) {
-        throw new Error(`Error deleting link: ${error.message}`);
+    } catch (error) {
+        throw new Error(`Failed to delete links: ${(error as Error).message}`);
     }
 }
 
@@ -341,6 +652,20 @@ const server = new McpServer({
 });
 
 async function main() {
+    // Validate configuration before starting the server
+    try {
+        config = getValidatedConfig();
+        NOCODB_URL = config.NOCODB_URL;
+        NOCODB_BASE_ID = config.NOCODB_BASE_ID;
+        NOCODB_API_TOKEN = config.NOCODB_API_TOKEN;
+    } catch (error) {
+        console.error('Configuration error:', (error as Error).message);
+        console.error('\nPlease provide the required environment variables or command line arguments:');
+        console.error('  NOCODB_URL=<url> NOCODB_BASE_ID=<id> NOCODB_API_TOKEN=<token> nocodb-mcp-server');
+        console.error('  OR');
+        console.error('  nocodb-mcp-server <url> <base_id> <token>');
+        process.exit(1);
+    }
 
     server.tool("nocodb-get-records",
         "Nocodb - Get Records" +
