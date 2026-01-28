@@ -4,6 +4,7 @@ import {StdioServerTransport} from "@modelcontextprotocol/sdk/server/stdio.js";
 import {z} from "zod";
 import axios, {AxiosInstance, AxiosError} from "axios";
 import {fork} from "node:child_process";
+import {logger} from "./logger.js";
 
 // Configuration validation schema
 const ConfigSchema = z.object({
@@ -114,10 +115,10 @@ For date null rule
 (date,is,null) -> (date,blank).
 `
 
-// Retry configuration
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000; // 1 second
-const REQUEST_TIMEOUT = 60000; // 60 seconds
+// Retry configuration (can be customized via environment variables)
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
+const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || '1000', 10); // milliseconds
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '60000', 10); // milliseconds
 
 // Simple sleep function for retry delays
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -143,28 +144,54 @@ async function axiosWithRetry<T>(
     context = "API request"
 ): Promise<T> {
     let lastError: Error | null = null;
+    const startTime = Date.now();
     
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            return await requestFn();
+            const result = await requestFn();
+            const duration = Date.now() - startTime;
+            
+            if (attempt > 0) {
+                logger.info(`${context} succeeded after ${attempt} retries`, { duration, attempts: attempt + 1 });
+            } else {
+                logger.debug(`${context} succeeded`, { duration });
+            }
+            
+            return result;
         } catch (error) {
             lastError = error as Error;
             
+            // Log the error
+            logger.debug(`${context} attempt ${attempt + 1} failed`, {
+                error: (error as Error).message,
+                attempt: attempt + 1,
+                maxAttempts: retries + 1
+            });
+            
             // Don't retry on client errors (4xx)
             if (axios.isAxiosError(error) && error.response?.status && error.response.status >= 400 && error.response.status < 500) {
+                logger.error(`${context} failed with client error`, {
+                    status: error.response.status,
+                    error: formatAxiosError(error)
+                });
                 throw new Error(formatAxiosError(error));
             }
             
             // If we have retries left, wait and try again
             if (attempt < retries) {
                 const delay = RETRY_DELAY * Math.pow(2, attempt); // Exponential backoff
-                console.error(`${context} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms...`);
+                logger.warn(`${context} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms...`);
                 await sleep(delay);
             }
         }
     }
     
     // All retries exhausted
+    logger.error(`${context} failed after all retries`, {
+        attempts: retries + 1,
+        error: lastError?.message
+    });
+    
     if (axios.isAxiosError(lastError)) {
         throw new Error(formatAxiosError(lastError));
     }
@@ -658,8 +685,14 @@ async function main() {
         NOCODB_URL = config.NOCODB_URL;
         NOCODB_BASE_ID = config.NOCODB_BASE_ID;
         NOCODB_API_TOKEN = config.NOCODB_API_TOKEN;
+        
+        logger.info('NocoDB MCP Server starting...', {
+            url: NOCODB_URL,
+            baseId: NOCODB_BASE_ID,
+            debugMode: process.env.DEBUG === 'true'
+        });
     } catch (error) {
-        console.error('Configuration error:', (error as Error).message);
+        logger.error('Configuration error', { error: (error as Error).message });
         console.error('\nPlease provide the required environment variables or command line arguments:');
         console.error('  NOCODB_URL=<url> NOCODB_BASE_ID=<id> NOCODB_API_TOKEN=<token> nocodb-mcp-server');
         console.error('  OR');
@@ -1073,11 +1106,16 @@ Example usage:
         })
     );
 
-// Start receiving messages on stdin and sending messages on stdout
+    // Start receiving messages on stdin and sending messages on stdout
+    logger.info('Starting MCP server transport...');
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    logger.info('NocoDB MCP Server is running and ready to accept requests');
 }
 
 
-void main();
+void main().catch((error) => {
+    logger.error('Fatal error during server startup', { error: error.message, stack: error.stack });
+    process.exit(1);
+});
 
