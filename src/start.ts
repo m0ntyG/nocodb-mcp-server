@@ -116,9 +116,28 @@ For date null rule
 `
 
 // Retry configuration (can be customized via environment variables)
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
-const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || '1000', 10); // milliseconds
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '60000', 10); // milliseconds
+function parseNonNegativeIntEnv(envValue: string | undefined, defaultValue: number, name: string): number {
+    if (!envValue) {
+        return defaultValue;
+    }
+    
+    const parsed = parseInt(envValue, 10);
+    
+    if (!Number.isFinite(parsed) || parsed < 0) {
+        logger.warn(
+            `Invalid value for ${name} ("${envValue}"). ` +
+            `Using default value ${defaultValue}. ` +
+            `Expected a non-negative integer.`
+        );
+        return defaultValue;
+    }
+    
+    return parsed;
+}
+
+const MAX_RETRIES = parseNonNegativeIntEnv(process.env.MAX_RETRIES, 3, "MAX_RETRIES");
+const RETRY_DELAY = parseNonNegativeIntEnv(process.env.RETRY_DELAY, 1000, "RETRY_DELAY"); // milliseconds
+const REQUEST_TIMEOUT = parseNonNegativeIntEnv(process.env.REQUEST_TIMEOUT, 60000, "REQUEST_TIMEOUT"); // milliseconds
 
 // Simple sleep function for retry delays
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -234,7 +253,7 @@ export async function getRecords(tableName: string,
 
         const tableId = await getTableId(tableName);
 
-        const paramsArray = []
+        const paramsArray = [];
         if (filters) {
             paramsArray.push(`where=${encodeURIComponent(filters)}`);
         }
@@ -254,8 +273,11 @@ export async function getRecords(tableName: string,
         }
 
         const queryString = paramsArray.join("&");
+        const url = queryString
+            ? `/api/v2/tables/${tableId}/records?${queryString}`
+            : `/api/v2/tables/${tableId}/records`;
         const response = await axiosWithRetry(
-            () => getNocodbClient().get(`/api/v2/tables/${tableId}/records?${queryString}`),
+            () => getNocodbClient().get(url),
             MAX_RETRIES,
             `Get records from table '${tableName}'`
         );

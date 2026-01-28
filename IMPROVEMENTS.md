@@ -7,7 +7,7 @@ This document describes the improvements made to the NocoDB MCP Server to increa
 ## Security Improvements
 
 ### 1. Dependency Updates
-- **Updated axios** from 1.8.4 to ^1.13.4 (fixes DoS vulnerability CVE-2024-XXXXX)
+- **Updated axios** from 1.8.4 to ^1.13.4 (addresses previously reported DoS vulnerability)
 - **Updated @modelcontextprotocol/sdk** from 1.8.0 to ^1.25.3 (fixes ReDoS and DNS rebinding vulnerabilities)
 - **All vulnerabilities resolved**: Zero security vulnerabilities in dependencies
 
